@@ -265,9 +265,10 @@ function ensureBenchmarkUnificationColumns(db: Database.Database) {
     ['nim_score', 'REAL'],
     ['nim_score_updated', 'TEXT'],
     ['nim_confidence', 'REAL'],
-    ['nim_tps', 'REAL'],
-    ['nim_ttfb_ms', 'REAL'],
+    ['nim_throughput_tps', 'REAL'],
+    ['nim_avg_response_ms', 'REAL'],
     ['nim_uptime_pct', 'REAL'],
+    ['benchmark_composite_version', 'INTEGER'],
   ];
 
   for (const [name, type] of newColumns) {
@@ -289,15 +290,17 @@ function ensureBenchmarkSourceWeightsTable(db: Database.Database) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL UNIQUE,
       weight REAL NOT NULL DEFAULT 1.0,
-      enabled INTEGER NOT NULL DEFAULT 1
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
-  // Seed default weights (idempotent)
+  // Seed default weights (idempotent) — per spec R4.1: aa=0.50, swe=0.30, nim=0.15
   const insert = db.prepare(`INSERT OR IGNORE INTO benchmark_source_weights (name, weight, enabled) VALUES (?, ?, 1)`);
-  insert.run('aa', 1.0);
-  insert.run('swe_rebench', 0.8);
-  insert.run('nim', 0.6);
+  insert.run('aa', 0.50);
+  insert.run('swe_rebench', 0.30);
+  insert.run('nim', 0.15);
 }
 
 // `requested_model` is the model id the CLIENT pinned in the request body.

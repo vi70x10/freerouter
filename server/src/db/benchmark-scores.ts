@@ -30,27 +30,14 @@ import { getDb } from './index.js';
 //   4. Replace dots with dashes (3.3 → 3-3)
 //
 // canonicalizeModelId('meta/llama-3.3-70b-instruct') === 'llama-3-3-70b'
-const STRIP_SUFFIXES = /-(instruct|chat|base|preview|fp\d+|fast|bf\d+|hf|gguf|awq|gptq)(-.*)?$/gi;
-
 export function canonicalizeModelId(modelId: string): string {
-  // 1. Strip provider prefix (everything before last '/')
-  const slashIdx = modelId.lastIndexOf('/');
-  let key = slashIdx >= 0 ? modelId.slice(slashIdx + 1) : modelId;
-
-  // 2. Lowercase
-  key = key.toLowerCase();
-
-  // 3. Remove fine-tune / quantization suffixes (iterate until stable)
-  let prev = '';
-  while (prev !== key) {
-    prev = key;
-    key = key.replace(STRIP_SUFFIXES, '');
-  }
-
-  // 4. Dots → dashes
-  key = key.replace(/\./g, '-');
-
-  return key;
+  // Per spec R10.2: exact algorithm from TASKS.md Task 1.2
+  return modelId
+    .toLowerCase()
+    .replace(/^[a-z0-9-]+\//, '')       // strip "provider/" prefix
+    .replace(/[-_]/g, '-')              // normalize separators
+    .replace(/-(instruct|chat|it|hf)$/, '')  // strip common suffixes
+    .replace(/\.(\d+)(?=\D|$)/g, '-$1'); // normalize version dots
 }
 
 // ─── SOURCE WEIGHT LOADING (with in-memory cache) ─────────────────────────
@@ -112,8 +99,11 @@ export function validateComposite(score: number): boolean {
 //   2. Apply source weights from benchmark_source_weights
 //   3. Weighted average → benchmark_score
 //   4. Canary-validate before writing
-export function recomputeBenchmarkComposite(db: Database.Database, affectedIds: Set<number>): number {
-  const weights = loadSourceWeights();
+export function recomputeBenchmarkComposite(
+  db: Database.Database,
+  affectedIds: Set<number>,
+  weights: Map<string, SourceWeight>,
+): number {
   let recomputed = 0;
 
   const select = db.prepare(`
@@ -124,14 +114,12 @@ export function recomputeBenchmarkComposite(db: Database.Database, affectedIds: 
   `);
 
   const update = db.prepare(`
-    UPDATE models SET benchmark_score = ?,
-      size_label = CASE
-        WHEN ? >= 45 THEN 'Frontier'
-        WHEN ? >= 26 THEN 'Large'
-        WHEN ? >= 13 THEN 'Medium'
-        ELSE 'Small'
-      END,
-      intelligence_rank = MAX(1, MIN(100, 101 - ?))
+    UPDATE models SET
+      benchmark_score = ?,
+      last_benchmark_update = ?,
+      size_label = ?,
+      intelligence_rank = ?,
+      benchmark_composite_version = ?
     WHERE id = ?
   `);
 
@@ -140,16 +128,33 @@ export function recomputeBenchmarkComposite(db: Database.Database, affectedIds: 
       const row = select.get(id) as any;
       if (!row) continue;
 
-      // Collect weighted contributions from each source
       let totalWeightedScore = 0;
       let totalWeight = 0;
+
+      // Helper: effective weight with staleness decay + confidence
+      const effectiveWeight = (
+        baseWeight: number,
+        updatedIso: string | null,
+        confidence: number | null,
+        sourceName: string,
+      ): number => {
+        const decay = stalenessDecay(updatedIso);
+        const conf = confidence ?? 1;
+        const w = baseWeight * decay * conf;
+        // R9.3: Log when decay reduces weight by >25% relative to base
+        if (decay < 0.75 && baseWeight > 0) {
+          console.log(
+            `[Benchmarks] Staleness decay applied: model id=${id}, source=${sourceName}` +
+            `, decay=${decay.toFixed(2)}, effectiveWeight=${w.toFixed(3)}`
+          );
+        }
+        return w;
+      };
 
       // AA source
       const aaW = weights.get('aa');
       if (aaW?.enabled && row.aa_score != null) {
-        const decay = stalenessDecay(row.aa_score_updated);
-        const confidence = row.aa_confidence ?? 1;
-        const w = aaW.weight * decay * confidence;
+        const w = effectiveWeight(aaW.weight, row.aa_score_updated, row.aa_confidence, 'aa');
         totalWeightedScore += row.aa_score * w;
         totalWeight += w;
       }
@@ -157,9 +162,7 @@ export function recomputeBenchmarkComposite(db: Database.Database, affectedIds: 
       // SWE-rebench source
       const sweW = weights.get('swe_rebench');
       if (sweW?.enabled && row.swe_rebench_score != null) {
-        const decay = stalenessDecay(row.swe_rebench_score_updated);
-        const confidence = row.swe_rebench_confidence ?? 1;
-        const w = sweW.weight * decay * confidence;
+        const w = effectiveWeight(sweW.weight, row.swe_rebench_score_updated, row.swe_rebench_confidence, 'swe_rebench');
         totalWeightedScore += row.swe_rebench_score * w;
         totalWeight += w;
       }
@@ -167,24 +170,37 @@ export function recomputeBenchmarkComposite(db: Database.Database, affectedIds: 
       // NIM source
       const nimW = weights.get('nim');
       if (nimW?.enabled && row.nim_score != null) {
-        const decay = stalenessDecay(row.nim_score_updated);
-        const confidence = row.nim_confidence ?? 1;
-        const w = nimW.weight * decay * confidence;
+        const w = effectiveWeight(nimW.weight, row.nim_score_updated, row.nim_confidence, 'nim');
         totalWeightedScore += row.nim_score * w;
         totalWeight += w;
       }
 
-      if (totalWeight <= 0) continue; // no valid sources
+      if (totalWeight <= 0) continue; // no valid sources (R4.4)
 
       const composite = totalWeightedScore / totalWeight;
 
-      // Canary: reject NaN, Infinity, <0, >100
+      // Canary: reject NaN, Infinity, <0, >100 (R8.1b)
       if (!validateComposite(composite)) {
-        console.warn(`[Composite] Invalid score ${composite} for model id=${id}, skipping`);
+        console.warn(`[Benchmarks] Invalid composite for model id=${id}: ${composite} — skipping`);
         continue;
       }
 
-      update.run(composite, composite, composite, composite, composite, id);
+      // Composite timestamp = max of available source timestamps
+      const timestamps = [row.aa_score_updated, row.swe_rebench_score_updated, row.nim_score_updated]
+        .filter((t: string | null) => t != null)
+        .map((t: string) => new Date(t).getTime());
+      const lastUpdate = timestamps.length > 0
+        ? new Date(Math.max(...timestamps)).toISOString()
+        : null;
+
+      update.run(
+        composite,
+        lastUpdate,
+        scoreToTier(composite),
+        scoreToIntelligenceRank(composite),
+        1, // COMPOSITE_VERSION
+        id,
+      );
       recomputed++;
     }
   });

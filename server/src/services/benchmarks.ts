@@ -6,6 +6,7 @@ import {
   canonicalizeModelId,
   recomputeBenchmarkComposite,
   backfillCanonicalKeys,
+  loadSourceWeights,
 } from '../db/benchmark-scores.js';
 
 export interface BenchmarkScore {
@@ -14,13 +15,14 @@ export interface BenchmarkScore {
   score: number;
   source: 'SWE-rebench' | 'HumanEval' | 'MMLU' | 'NIM';
   lastUpdated: Date;
+  confidence?: number; // per-source confidence: 1.0 live, 0.6 hardcoded fallback
   // Per-source breakdown
   aaScore?: number | null;
   sweRebenchScore?: number | null;
   nimScore?: number | null;
-  // NIM-specific speed/reliability metrics (nullable)
-  nimTps?: number | null;
-  nimTtfbMs?: number | null;
+  // NIM-specific speed/reliability metrics (nullable) — per spec R5.1
+  nimThroughputTps?: number | null;
+  nimAvgResponseMs?: number | null;
   nimUptimePct?: number | null;
 }
 
@@ -89,11 +91,14 @@ export class BenchmarkService {
       platform: this.extractPlatform(modelId),
       score: this.normalizeScore(score),
       source: 'SWE-rebench' as const,
-      lastUpdated: new Date()
+      lastUpdated: new Date(),
+      confidence: 0.6, // hardcoded fallback → confidence 0.6 per R2.1b
     }));
   }
 
-  /** Convert parsed SWE-rebench entries into BenchmarkScore objects. */
+  /** Convert parsed SWE-rebench entries into BenchmarkScore objects.
+   *  Live scrape → confidence 1.0 per spec R2.1b.
+   */
   private entriesToBenchmarkScores(entries: SWERebenchEntry[]): BenchmarkScore[] {
     return entries
       .filter(e => e.resolvedRate > 0)
@@ -105,6 +110,7 @@ export class BenchmarkService {
           score: this.normalizeScore(entry.resolvedRate),
           source: 'SWE-rebench' as const,
           lastUpdated: new Date(),
+          confidence: 1.0, // live scrape → confidence 1.0 per R2.1b
         };
       });
   }
@@ -131,8 +137,8 @@ export class BenchmarkService {
           score: this.normalizeScore(model.score || 0),
           source: 'NIM' as const,
           lastUpdated: new Date(),
-          nimTps: model.tps ?? model.tokens_per_second ?? null,
-          nimTtfbMs: model.ttfb_ms ?? model.ttfb ?? null,
+          nimThroughputTps: model.tps ?? model.tokens_per_second ?? model.throughput_tps ?? null,
+          nimAvgResponseMs: model.ttfb_ms ?? model.ttfb ?? model.avg_response_ms ?? null,
           nimUptimePct: model.uptime_pct ?? model.uptime ?? null,
         }));
       }
@@ -145,8 +151,8 @@ export class BenchmarkService {
           score: this.normalizeScore(item.score || item.accuracy || 0),
           source: 'NIM' as const,
           lastUpdated: new Date(),
-          nimTps: item.tps ?? item.tokens_per_second ?? null,
-          nimTtfbMs: item.ttfb_ms ?? item.ttfb ?? null,
+          nimThroughputTps: item.tps ?? item.tokens_per_second ?? item.throughput_tps ?? null,
+          nimAvgResponseMs: item.ttfb_ms ?? item.ttfb ?? item.avg_response_ms ?? null,
           nimUptimePct: item.uptime_pct ?? item.uptime ?? null,
         }));
       }
@@ -187,7 +193,7 @@ export class BenchmarkService {
       UPDATE models
       SET swe_rebench_score = ?,
           swe_rebench_score_updated = ?,
-          swe_rebench_confidence = 1.0
+          swe_rebench_confidence = ?
       WHERE canonical_model_key = ?
         AND (swe_rebench_score IS NULL OR swe_rebench_score != ?)
     `);
@@ -197,8 +203,9 @@ export class BenchmarkService {
     const tx = db.transaction(() => {
       for (const score of scores) {
         const canonicalKey = canonicalizeModelId(score.modelId);
+        const confidence = score.confidence ?? 1.0;
         const result = upsert.run(
-          score.score, score.lastUpdated.toISOString(),
+          score.score, score.lastUpdated.toISOString(), confidence,
           canonicalKey, score.score
         );
         if (result.changes > 0) {
@@ -219,7 +226,7 @@ export class BenchmarkService {
   /**
    * Fetch and upsert NIM scores into per-source columns ONLY.
    * NIM writes to: nim_score, nim_score_updated, nim_confidence,
-   *   nim_tps, nim_ttfb_ms, nim_uptime_pct.
+   *   nim_throughput_tps, nim_avg_response_ms, nim_uptime_pct.
    * Uses canonical_model_key for matching.
    * Returns affected model IDs for composite recomputation.
    */
@@ -234,8 +241,8 @@ export class BenchmarkService {
       SET nim_score = ?,
           nim_score_updated = ?,
           nim_confidence = 1.0,
-          nim_tps = ?,
-          nim_ttfb_ms = ?,
+          nim_throughput_tps = ?,
+          nim_avg_response_ms = ?,
           nim_uptime_pct = ?
       WHERE canonical_model_key = ?
         AND (nim_score IS NULL OR nim_score != ?)
@@ -248,7 +255,7 @@ export class BenchmarkService {
         const canonicalKey = canonicalizeModelId(score.modelId);
         const result = upsert.run(
           score.score, score.lastUpdated.toISOString(),
-          score.nimTps ?? null, score.nimTtfbMs ?? null, score.nimUptimePct ?? null,
+          score.nimThroughputTps ?? null, score.nimAvgResponseMs ?? null, score.nimUptimePct ?? null,
           canonicalKey, score.score
         );
         if (result.changes > 0) {
@@ -329,7 +336,8 @@ export class BenchmarkService {
 
       // Recompute composites for affected rows only (incremental)
       if (allAffectedIds.size > 0) {
-        recomputeBenchmarkComposite(db, allAffectedIds);
+        const weights = loadSourceWeights();
+        recomputeBenchmarkComposite(db, allAffectedIds, weights);
       }
 
       console.log(`[Benchmarks] Total: ${totalUpdated} models updated, ${allAffectedIds.size} composites recomputed`);
@@ -356,7 +364,7 @@ export class BenchmarkService {
              last_benchmark_update as lastUpdated,
              aa_score as aaScore, swe_rebench_score as sweRebenchScore,
              nim_score as nimScore,
-             nim_tps as nimTps, nim_ttfb_ms as nimTtfbMs, nim_uptime_pct as nimUptimePct
+             nim_throughput_tps as nimThroughputTps, nim_avg_response_ms as nimAvgResponseMs, nim_uptime_pct as nimUptimePct
       FROM models
       WHERE benchmark_score IS NOT NULL
       ORDER BY benchmark_score DESC
@@ -371,8 +379,8 @@ export class BenchmarkService {
       aaScore: row.aaScore,
       sweRebenchScore: row.sweRebenchScore,
       nimScore: row.nimScore,
-      nimTps: row.nimTps,
-      nimTtfbMs: row.nimTtfbMs,
+      nimThroughputTps: row.nimThroughputTps,
+      nimAvgResponseMs: row.nimAvgResponseMs,
       nimUptimePct: row.nimUptimePct,
     }));
   }
@@ -384,7 +392,7 @@ export class BenchmarkService {
              last_benchmark_update as lastUpdated,
              aa_score as aaScore, swe_rebench_score as sweRebenchScore,
              nim_score as nimScore,
-             nim_tps as nimTps, nim_ttfb_ms as nimTtfbMs, nim_uptime_pct as nimUptimePct
+             nim_throughput_tps as nimThroughputTps, nim_avg_response_ms as nimAvgResponseMs, nim_uptime_pct as nimUptimePct
       FROM models
       WHERE platform = ? AND benchmark_score IS NOT NULL
       ORDER BY benchmark_score DESC
@@ -399,8 +407,8 @@ export class BenchmarkService {
       aaScore: row.aaScore,
       sweRebenchScore: row.sweRebenchScore,
       nimScore: row.nimScore,
-      nimTps: row.nimTps,
-      nimTtfbMs: row.nimTtfbMs,
+      nimThroughputTps: row.nimThroughputTps,
+      nimAvgResponseMs: row.nimAvgResponseMs,
       nimUptimePct: row.nimUptimePct,
     }));
   }

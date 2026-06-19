@@ -56,9 +56,11 @@ interface ChainRow {
    * Intelligence Index. NULL = no published score. When available, this is a
    * much better cross-provider intelligence signal than size_label + rank. */
   benchmark_score: number | null;
-  /** NIM speed/reliability metrics — Phase 1: SELECTed and LOGGED, never blended. */
-  nim_tps: number | null;
-  nim_ttfb_ms: number | null;
+  /** NIM speed/reliability metrics — Phase 1: SELECTed and LOGGED, never blended.
+   *  Per spec R5.1: nim_throughput_tps, nim_avg_response_ms, nim_uptime_pct.
+   */
+  nim_throughput_tps: number | null;
+  nim_avg_response_ms: number | null;
   nim_uptime_pct: number | null;
 }
 
@@ -434,13 +436,13 @@ function scoreChainEntry(
   const rl = rateLimitFactor(getPenalty(entry.model_db_id));
 
   // Phase 1: log NIM metrics if available, but do NOT blend into routing scores
-  if (entry.nim_tps != null || entry.nim_ttfb_ms != null || entry.nim_uptime_pct != null) {
+  if (entry.nim_throughput_tps != null || entry.nim_avg_response_ms != null || entry.nim_uptime_pct != null) {
     console.log(
-      `[Router] NIM metrics available: model=${entry.model_id}` +
-      ` tps=${entry.nim_tps ?? 'n/a'}` +
-      ` ttfb=${entry.nim_ttfb_ms ?? 'n/a'}ms` +
-      ` uptime=${entry.nim_uptime_pct ?? 'n/a'}%` +
-      ` (not blended — Phase 1)`
+      `[Router] NIM metrics available: model=${entry.platform}/${entry.model_id}`,
+      `tps=${entry.nim_throughput_tps ?? 'N/A'}`,
+      `ttfb=${entry.nim_avg_response_ms ?? 'N/A'}ms`,
+      `uptime=${entry.nim_uptime_pct ?? 'N/A'}%`,
+      `(not blended — Phase 1)`,
     );
   }
 
@@ -518,7 +520,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.max_output_tokens, m.key_id,
            m.benchmark_score,
-           m.nim_tps, m.nim_ttfb_ms, m.nim_uptime_pct
+           m.nim_throughput_tps, m.nim_avg_response_ms, m.nim_uptime_pct
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     WHERE fc.enabled = 1
@@ -741,7 +743,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
            m.size_label,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.benchmark_score, m.context_window, m.max_output_tokens,
-           m.nim_tps, m.nim_ttfb_ms, m.nim_uptime_pct
+           m.nim_throughput_tps, m.nim_avg_response_ms, m.nim_uptime_pct
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     WHERE m.enabled = 1

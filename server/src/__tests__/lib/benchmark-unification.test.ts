@@ -6,29 +6,29 @@ import {
 } from '../../db/benchmark-scores.js';
 
 // ── canonicalizeModelId ─────────────────────────────────────────────────────
+// Per spec R10.2: exact regex from TASKS.md Task 1.2
 describe('canonicalizeModelId', () => {
   it('strips provider prefix and lowercases', () => {
     expect(canonicalizeModelId('meta/Llama-3.3-70B')).toBe('llama-3-3-70b');
-    expect(canonicalizeModelId('openai/gpt-5')).toBe('gpt-5');
   });
 
-  it('removes -instruct suffix', () => {
+  it('strips -instruct suffix (spec example)', () => {
     expect(canonicalizeModelId('meta/llama-3.3-70b-instruct')).toBe('llama-3-3-70b');
   });
 
-  it('removes -chat suffix', () => {
+  it('strips -chat suffix', () => {
     expect(canonicalizeModelId('google/gemini-3.1-pro-chat')).toBe('gemini-3-1-pro');
   });
 
-  it('removes -base suffix', () => {
-    expect(canonicalizeModelId('meta/llama-3.1-8b-base')).toBe('llama-3-1-8b');
+  it('strips -it suffix (spec example)', () => {
+    expect(canonicalizeModelId('google/gemma-4-31b-it')).toBe('gemma-4-31b');
   });
 
-  it('removes -preview suffix', () => {
-    expect(canonicalizeModelId('qwen/qwen3.6-max-preview')).toBe('qwen3-6-max');
+  it('strips -hf suffix', () => {
+    expect(canonicalizeModelId('mistral/mistral-7b-hf')).toBe('mistral-7b');
   });
 
-  it('replaces dots with dashes', () => {
+  it('normalizes version dots to dashes', () => {
     expect(canonicalizeModelId('gpt-5.5')).toBe('gpt-5-5');
     expect(canonicalizeModelId('gemini-3.1-pro')).toBe('gemini-3-1-pro');
   });
@@ -38,17 +38,20 @@ describe('canonicalizeModelId', () => {
     expect(canonicalizeModelId('gpt-5')).toBe('gpt-5');
   });
 
-  it('removes quantization suffixes like -fp8, -awq, -gptq', () => {
-    expect(canonicalizeModelId('llama-3.3-70b-instruct-fp8-fast')).toBe('llama-3-3-70b');
-  });
-
   it('preserves param size like 70b, 8b', () => {
     expect(canonicalizeModelId('llama-3.3-70b')).toBe('llama-3-3-70b');
     expect(canonicalizeModelId('llama-3.1-8b')).toBe('llama-3-1-8b');
   });
 
-  it('the spec example: meta/llama-3.3-70b-instruct → llama-3-3-70b', () => {
-    expect(canonicalizeModelId('meta/llama-3.3-70b-instruct')).toBe('llama-3-3-70b');
+  it('normalizes underscores to hyphens', () => {
+    expect(canonicalizeModelId('some_model_v4')).toBe('some-model-v4');
+  });
+
+  it('spec example: deepseek-ai/deepseek-v4-flash → deepseek-v4-flash', () => {
+    // Per spec: prefix strip removes 'deepseek-ai/' then '-flash' suffix not in strip list
+    const result = canonicalizeModelId('deepseek-ai/deepseek-v4-flash');
+    // The regex strips 'deepseek-ai/' prefix, result is 'deepseek-v4-flash'
+    expect(result).toBe('deepseek-v4-flash');
   });
 });
 
